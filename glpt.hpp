@@ -570,6 +570,47 @@ class glpt {
 			return false;
 		}
 
+		//! EXACT (integer) version of vertex_weights(), for the SAME
+		//! reason as root_boundary_facet(): every quantity is dyadic
+		//! rational with denominator exactly 2^(orthant_level()+1) (see
+		//! that function's own comment), representable exactly as a
+		//! small integer at any depth. w_num[k][j] = w[k][j] *
+		//! 2^(orthant_level()+1) exactly; denom_shift is set to
+		//! orthant_level()+1 (i.e. the actual denominator is
+		//! 1<<denom_shift) so callers combining weights from cells at
+		//! DIFFERENT orthant_level (e.g. a parent and its child, when the
+		//! child starts a new round) can bring them to a common
+		//! denominator before comparing. Used by the vertex-ID layer
+		//! (glpt_vertex_ids.hpp) to identify, by EXACT equality rather
+		//! than floating-point closeness, which of a child's vertices are
+		//! inherited unchanged from the parent and which one is the new
+		//! bisection midpoint.
+		void vertex_weights_exact(int w_num[DIM+1][DIM+1], int& denom_shift) const {
+			int ol = orthant_level();
+			denom_shift = ol+1;
+			int t_num[DIM];
+			for(int j=0;j<DIM;++j) t_num[j]=0;
+			for(int i=0;i<ol;++i) {
+				int term = 1<<(ol-1-i);
+				for(int j=0;j<DIM;++j) {
+					if(orthant_get(j)&(1<<(ol-1-i))) t_num[j]-=term;
+					else t_num[j]+=term;
+				}
+			}
+			for(int k=0;k<=DIM;++k) {
+				int pt_num[DIM];
+				for(int j=0;j<DIM;++j) {
+					int v_raw = (k>j) ? 1 : ((k<level()) ? 0 : -1);
+					int p = sigperm_entry(j+1);
+					int col = (p<0?-p:p)-1;
+					pt_num[col] = ((p<0)?-v_raw:v_raw) + t_num[col];
+				}
+				w_num[k][0] = (1<<ol) - pt_num[0];
+				for(int c=1;c<DIM;++c) w_num[k][c] = pt_num[c-1]-pt_num[c];
+				w_num[k][DIM] = (1<<ol) + pt_num[DIM-1];
+			}
+		}
+
 		// Sentinel returned by neighbor() when the geometric approach
 		// itself can't resolve a result (should be essentially never --
 		// see glpt_neighbor_geometric's own comment).
