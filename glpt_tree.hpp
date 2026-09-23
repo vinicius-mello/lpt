@@ -104,6 +104,7 @@
 #include "glpt.hpp"
 #include <cstdlib>
 #include <set>
+#include <vector>
 
 static inline uint64_t glpt_tree_hash(uint64_t x) {
 	// Same splitmix64-style avalanche as ~/code/lua/lpt/hash.c's lpt_hash.
@@ -153,12 +154,45 @@ class glpt_tree {
 
 		//! Bisects leaf `r` (which MUST currently exists()) into its two
 		//! children, atomically: erase(r), insert(child(0)), insert(child(1)).
+		//! Both new children are appended to recent_leaves() (see its own
+		//! comment) -- NOT cleared first, so a caller driving a priority-
+		//! queue refinement loop can call clear_recent() once, then
+		//! compat_bisect() (which can bisect many cells in one call, via
+		//! its own neighbor-forcing recursion) and read back everything
+		//! that was created, not just r's own two children.
 		void bisect(const glpt& r) {
 			assert(exists(r) && "glpt_tree::bisect: r is not a current leaf");
 			erase_(r.raw());
-			insert_(r.child(0).raw());
-			insert_(r.child(1).raw());
+			glpt c0=r.child(0), c1=r.child(1);
+			insert_(c0.raw());
+			insert_(c1.raw());
+			recent_.push_back(c0);
+			recent_.push_back(c1);
 		}
+
+		//! Cells inserted since the last clear_recent() call, across
+		//! however many bisect() calls happened in between (a single
+		//! compat_bisect() can trigger several, via its own recursive
+		//! neighbor-forcing) -- mirrors lpt.hpp's own lpt_tree<lpt>::recent
+		//! list, which exists for exactly this reason (a caller driving a
+		//! priority-queue refinement loop needs to know every new leaf to
+		//! push, not just the ones from the top-level bisect() call it
+		//! made itself).
+		//!
+		//! NOT the same as "every CURRENT leaf inserted since
+		//! clear_recent()": an entry can be superseded (bisected again)
+		//! LATER within the same compat_bisect() call, e.g. if forcing one
+		//! neighbor finer creates a cell that a DIFFERENT neighbor's own
+		//! forcing then needs to refine again -- that cell's own children
+		//! are separately present in recent_ from THAT later bisect(), so
+		//! nothing is lost, but a stale entry can appear here. A caller
+		//! must check exists() before using each one -- exactly the check
+		//! a priority-queue consumer already needs when popping (an entry
+		//! can just as easily go stale AFTER being queued, not only before
+		//! being read out of recent_leaves()). Found by
+		//! glpt_tree_test.cpp's own test, not merely assumed away.
+		const std::vector<glpt>& recent_leaves() const { return recent_; }
+		void clear_recent() { recent_.clear(); }
 
 		//! Bisects `r`, first recursively bisecting whichever neighbors
 		//! are needed to keep the mesh 1-level graded (no same-level
@@ -243,6 +277,7 @@ class glpt_tree {
 		size_t nbuckets_;
 		size_t count_;
 		std::set<glpt> pending_; // compat_bisect_rec()'s own in-progress set
+		std::vector<glpt> recent_; // see recent_leaves()'s own comment
 
 		void compat_bisect_rec(const glpt& r) {
 			pending_.insert(r);

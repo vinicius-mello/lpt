@@ -233,11 +233,63 @@ void test_compat_bisect() {
 	printf("graded-invariant check: %ld facet checks, %ld violations\n", n_checked, n_violations);
 }
 
+void test_recent_leaves() {
+	printf("--- test 5: recent_leaves() reports every leaf compat_bisect() creates ---\n");
+	glpt_tree tree;
+	tree.seed_all_roots();
+	srand(24680);
+
+	std::vector<uint64_t> leaves;
+	struct Collector { std::vector<uint64_t>* out; void operator()(const glpt& c) const { out->push_back(c.raw()); } };
+	for(int s=0;s<GLPT_NCELLS;++s) leaves.push_back(glpt(s).raw());
+
+	long n_recent_total=0, n_not_existing=0, n_odd_count=0;
+	for(int round=0; round<500; ++round) {
+		if(round%25==0) { leaves.clear(); Collector col; col.out=&leaves; tree.for_each_leaf(col); }
+		int idx = rand() % (int)leaves.size();
+		glpt r = glpt::from_raw(leaves[idx]);
+		if(!tree.exists(r)) continue;
+		if(r.orthant_level()>=glpt::MAX_ORTHANT_LEVEL-2) continue;
+
+		size_t before = tree.leaf_count();
+		tree.clear_recent();
+		tree.compat_bisect(r);
+		size_t after = tree.leaf_count();
+
+		const std::vector<glpt>& recent = tree.recent_leaves();
+		n_recent_total += (long)recent.size();
+		// NOTE (found by this test, 2026-09-23): an entry here need NOT
+		// still exists() by the time the whole compat_bisect() call
+		// returns -- a cell created early in the cascade (e.g. while
+		// forcing a neighbor finer) can itself get bisected AGAIN later
+		// in the SAME call (e.g. because forcing ANOTHER neighbor then
+		// required it too), leaving it superseded by its own children
+		// (which are separately present in recent_ from THAT bisect()
+		// call). This is not a bug: recent_leaves() is "every cell
+		// inserted since clear_recent()", not "every current leaf
+		// inserted since clear_recent()" -- a priority-queue-driven
+		// refinement loop naturally handles this exactly the way it
+		// already must handle a POPPED entry going stale (check exists()
+		// before using each entry; skip if gone), so this is tracked as
+		// an informational count, not a failure.
+		for(size_t i=0;i<recent.size();++i) if(!tree.exists(recent[i])) ++n_not_existing;
+		// Every bisect() call nets exactly +1 leaf and appends 2 entries to
+		// recent_ -- so recent_.size() must be exactly 2*(number of
+		// bisections), and leaf_count() grows by exactly recent_.size()/2.
+		if(recent.size()%2!=0) ++n_odd_count;
+		CHECK(after-before == recent.size()/2, "leaf_count() growth doesn't match recent_leaves().size()/2");
+	}
+	CHECK(n_odd_count==0, "recent_leaves() had an odd number of entries after some compat_bisect() call");
+	printf("total recent entries across all calls=%ld, later-superseded(informational)=%ld, odd-count calls=%ld\n",
+		n_recent_total, n_not_existing, n_odd_count);
+}
+
 int main() {
 	test_basic_seed_bisect();
 	test_heavy_churn();
 	test_neighbor_leaf_transitions();
 	test_compat_bisect();
+	test_recent_leaves();
 
 	printf("\n%s (%d failures)\n", g_fail==0 ? "ALL CHECKS PASSED" : "CHECKS FAILED", g_fail);
 	return g_fail==0 ? 0 : 1;
