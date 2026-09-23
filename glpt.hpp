@@ -396,6 +396,11 @@ class glpt {
 		//! sigperm=0 (identity -- the cell's own vertex list IS already the
 		//! canonical Maubach order), orthant_level=0.
 		explicit glpt(int seed) : code_(0) { set(SEED_OFF,SEED_BITS,seed); }
+		//! Reconstructs a cell from its own raw() value (e.g. read back out
+		//! of glpt_tree's storage, which keeps codes, not glpt objects).
+		//! No validation -- the caller is responsible for `code` actually
+		//! being a value some glpt object's raw() once returned.
+		static glpt from_raw(uint64_t code) { glpt g; g.code_=code; return g; }
 
 		int seed_index() const { return get(SEED_OFF,SEED_BITS); }
 		int level() const { return get(LEVEL_OFF,LEVEL_BITS); }
