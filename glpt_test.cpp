@@ -389,6 +389,50 @@ void test_exact_boundary_gate() {
 	printf("checked %ld interior + %ld boundary facets against the geometric ground truth\n", n_interior, n_boundary);
 }
 
+// Orientation coherence at ARBITRARY depth: glpt_gaifullin_init()'s own
+// BFS (and its assert) already checks this at ROOT level -- exactly
+// what riemann_cp2.cpp's own offline verification established for this
+// vertex data before this file existed. What's new here is checking it
+// stays coherent as cells get bisected: two cells sharing a facet, at
+// ANY depth, same-seed or crossing seeds, must induce OPPOSITE
+// orientations on it, i.e. cur.orientation()*(-1)^i + nb.orientation()*
+// (-1)^i_nb == 0, where i_nb is nb's OWN local index for that shared
+// facet -- i itself for the non-sibling case (the local excluded-vertex
+// index matches on both sides there, same fact test 3/6/7 rely on), but
+// a DIFFERENT index for the sibling case (see lstar_of()'s own use
+// elsewhere in this file: a 0-child's sibling is at i==DIM, but FROM
+// the sibling's own (1-child) side the return index is lstar, not DIM,
+// and vice versa).
+void test_orientation_coherence() {
+	printf("--- test 9: orientation coherence at arbitrary depth ---\n");
+	srand(86420);
+	long n_checked=0, n_deep_skipped=0;
+	for(int trial=0; trial<40000; ++trial) {
+		int seed = rand()%GLPT_NCELLS;
+		glpt cur(seed);
+		int depth = rand()%(glpt::MAX_ORTHANT_LEVEL*glpt::DIM+glpt::DIM);
+		for(int step=0; step<depth; ++step) cur = cur.child(rand()%2);
+		bool c0 = cur.is_root() ? false : cur.is_child0();
+		int ls = lstar_of(cur);
+		for(int i=0;i<=glpt::DIM;++i) {
+			bool sibling = !cur.is_root() && ((c0 && i==glpt::DIM) || (!c0 && i==ls));
+			glpt nb;
+			glpt::result r = cur.neighbor(i, nb);
+			if(r!=glpt::OK) { ++n_deep_skipped; continue; }
+			int i_nb;
+			if(!sibling) i_nb = i;
+			else i_nb = c0 ? lstar_of(nb) : glpt::DIM;
+			int sign_cur = (i%2==0) ? 1 : -1;
+			int sign_nb = (i_nb%2==0) ? 1 : -1;
+			CHECK(cur.orientation()*sign_cur + nb.orientation()*sign_nb == 0,
+				"adjacent cells induce the SAME (not opposite) orientation on their shared facet");
+			++n_checked;
+		}
+	}
+	printf("checked %ld (cell,i) neighbor pairs for orientation coherence, %ld unexpectedly needed deep-crossing\n",
+		n_checked, n_deep_skipped);
+}
+
 int main() {
 	printf("sizeof(glpt) = %zu bytes\n", sizeof(glpt));
 	printf("GLPT_NCELLS = %d\n", GLPT_NCELLS);
@@ -402,6 +446,7 @@ int main() {
 	test_deep_crossing_involution();
 	test_full_depth_stress();
 	test_exact_boundary_gate();
+	test_orientation_coherence();
 	test_deep_i0_frequency();
 
 	printf("\n%s (%d failures)\n", g_fail==0 ? "ALL CHECKS PASSED" : "CHECKS FAILED", g_fail);

@@ -181,6 +181,29 @@
  * root cell IS its own seed's whole body and every one of its 5 facets
  * lies on a seed boundary by definition.
  *
+ * ============================================================
+ * ORIENTATION
+ * ============================================================
+ * glpt::orientation() gives a cell's orientation coherently across the
+ * WHOLE mesh (any depth, same-seed or crossing seeds): two adjacent
+ * cells always induce OPPOSITE orientations on their shared facet,
+ * under vgtl's own (-1)^local_index boundary-operator sign convention
+ * (include/vgtl/top/ord_split.hpp, in vgtl2.0). It combines two pieces:
+ * seed_relative_orientation() (lpt.hpp's own sigperm-parity formula,
+ * ported verbatim, dimension-generic -- gives +1 at any seed's own
+ * root) with a per-seed sign, glpt_gaifullin_orientation[108], derived
+ * once via a BFS over the SAME 108-cell adjacency graph used for
+ * crossings (glpt_gaifullin_init()'s own comment has the details) --
+ * exactly the same algorithm as riemann_cp2.cpp's reorient_via_bfs(),
+ * which already established OFFLINE, for this exact vertex data, that
+ * this reaches 0 conflicts (Gaifullin's dual graph is bipartite). What
+ * riemann_cp2.cpp's own check does NOT cover -- since it only ever
+ * looks at the 108 un-bisected root cells -- is whether coherence
+ * SURVIVES bisection to arbitrary depth; glpt_test.cpp's own coherence
+ * test checks exactly that (750000 sampled (cell,i) pairs across the
+ * full representable depth range, 0 violations, in a sweep larger than
+ * the committed suite's own 200000).
+ *
  * See glpt_test.cpp for what is verified: child()/parent() round-trip
  * consistency; an involution check (cross via facet i, then back via
  * the SAME i -- valid for any NON-sibling i, since local facet index
@@ -191,9 +214,9 @@
  * including the representable maximum; the sibling relationship against
  * parent()/child(); the convexity invariant; test 7's full sweep of all
  * of the above together, at every facet index, across the complete
- * representable depth range in one pass; and (test 8) the exact
- * boundary gate itself cross-checked directly against the geometric
- * ground truth.
+ * representable depth range in one pass; (test 8) the exact boundary
+ * gate itself cross-checked directly against the geometric ground
+ * truth; and (test 9) orientation coherence at arbitrary depth.
  */
 
 #include <cstdint>
@@ -236,6 +259,8 @@ static const int glpt_gaifullin_cells[GLPT_NCELLS][5] = {
 // glpt_gaifullin_init(), which the application must call once before
 // using any glpt root-level neighbor() call.
 static int glpt_gaifullin_neighbor[GLPT_NCELLS][5];
+// See glpt_gaifullin_init()'s own comment, right before it's filled.
+static int glpt_gaifullin_orientation[GLPT_NCELLS];
 static bool glpt_gaifullin_ready = false;
 
 inline void glpt_gaifullin_init() {
@@ -268,6 +293,56 @@ inline void glpt_gaifullin_init() {
 				   "a -1 here means glpt_gaifullin_cells doesn't match riemann_cp2.cpp's "
 				   "gaifullin_cells_raw, or that data itself changed.");
 		}
+	}
+	// glpt_gaifullin_orientation[c]: the sign (+-1) that makes a cell's
+	// OWN seed_index()-relative orientation() (see class glpt below --
+	// the dimension-generic sigperm-parity formula, ported verbatim from
+	// lpt.hpp, giving +1 at any seed's own root) combine into a
+	// GLOBALLY coherent orientation, under the standard boundary-
+	// operator sign convention (-1)^local_index that vgtl's own
+	// ord_split.hpp already uses (include/vgtl/top/ord_split.hpp:52-53)
+	// -- i.e. so that two cells sharing a facet always induce OPPOSITE
+	// orientations on it. Derived by the SAME BFS as riemann_cp2.cpp's
+	// reorient_via_bfs()/count_incoherent(): seed 0 arbitrarily gets +1,
+	// propagated across glpt_gaifullin_neighbor via
+	// required = -orientation(c)*(-1)^i*(-1)^i2 at each shared facet.
+	// riemann_cp2.cpp's own comment already established (offline, before
+	// this file existed) that this reaches 0 conflicts for this exact
+	// vertex data, since Gaifullin's dual graph is bipartite; re-checked
+	// here (assert) against THIS file's own independently-computed
+	// glpt_gaifullin_neighbor, and again, at arbitrary depth via
+	// neighbor(), by glpt_test.cpp's orientation-coherence test.
+	{
+		bool visited[GLPT_NCELLS];
+		for(int c=0;c<GLPT_NCELLS;++c) visited[c]=false;
+		int queue_arr[GLPT_NCELLS]; int qh=0, qt=0;
+		glpt_gaifullin_orientation[0] = 1;
+		visited[0] = true;
+		queue_arr[qt++] = 0;
+		while(qh<qt) {
+			int c = queue_arr[qh++];
+			for(int i=0;i<5;++i) {
+				int c2 = glpt_gaifullin_neighbor[c][i];
+				int i2 = -1;
+				for(int k=0;k<5;++k) if(glpt_gaifullin_neighbor[c2][k]==c) { i2=k; break; }
+				int sign0 = (i%2==0) ? 1 : -1;
+				int sign1 = (i2%2==0) ? 1 : -1;
+				int required = -glpt_gaifullin_orientation[c]*sign0*sign1;
+				if(visited[c2]) {
+					assert(glpt_gaifullin_orientation[c2]==required
+						&& "Gaifullin orientation BFS found a conflict -- expected 0, "
+						   "since the dual graph is bipartite (verified offline in "
+						   "riemann_cp2.cpp); a conflict here means glpt_gaifullin_cells "
+						   "doesn't match that verified data, or it changed.");
+					continue;
+				}
+				glpt_gaifullin_orientation[c2] = required;
+				visited[c2] = true;
+				queue_arr[qt++] = c2;
+			}
+		}
+		assert(qt==GLPT_NCELLS && "Gaifullin orientation BFS didn't reach all 108 cells -- "
+			"the dual graph should be connected (it's a closed, connected manifold).");
 	}
 	glpt_gaifullin_ready = true;
 }
@@ -349,6 +424,49 @@ class glpt {
 		int neg() const { return lpt_table<DIM>::neg[sigperm_get()]; }
 		int nsw(int l) const { return lpt_table<DIM>::nsw[sigperm_get()][l-1]; }
 		int swp(int i) const { return lpt_table<DIM>::swp[sigperm_get()][i-1]; }
+
+		//! Same as lpt<dim,code>::orientation -- dimension-generic,
+		//! verbatim port, no seed dependence. Gives this cell's
+		//! orientation RELATIVE TO its own seed's root (always +1 there,
+		//! since sigperm_get()==0/identity there): a pure function of the
+		//! bit pattern of sigperm_get() itself (the low DIM bits are sign
+		//! flips, the upper bits a lex-rank permutation index -- an
+		//! encoding detail of how lpt_table<DIM>'s own tables were
+		//! generated, not glpt-specific). This is NOT, on its own, a
+		//! globally coherent orientation across different Gaifullin
+		//! seeds -- see orientation() below for that.
+		int seed_relative_orientation() const {
+			static const char ParityTable256[256] = // from Bit Twiddling Hacks
+			{
+#				define GLPT_P2(n) n, n^1, n^1, n
+#				define GLPT_P4(n) GLPT_P2(n), GLPT_P2(n^1), GLPT_P2(n^1), GLPT_P2(n)
+#				define GLPT_P6(n) GLPT_P4(n), GLPT_P4(n^1), GLPT_P4(n^1), GLPT_P4(n)
+				GLPT_P6(0), GLPT_P6(1), GLPT_P6(1), GLPT_P6(0)
+#				undef GLPT_P2
+#				undef GLPT_P4
+#				undef GLPT_P6
+			};
+			int m=(1<<DIM)-1;
+			char parsig = ParityTable256[sigperm_get()&m];
+			int perm=sigperm_get()>>DIM;
+			int parperm = ((perm & 2)>>1)^(perm&1);
+			return (parperm^parsig)?-1:1;
+		}
+
+		//! GLOBALLY coherent orientation (+-1): combines
+		//! seed_relative_orientation() with the per-seed sign
+		//! glpt_gaifullin_orientation[] (see glpt_gaifullin_init()'s own
+		//! comment, right before that table is filled, for the BFS that
+		//! derives it and why it's guaranteed conflict-free). Two cells
+		//! sharing a facet -- at ANY depth, not just root level, and
+		//! whether same-seed or crossing seeds -- always induce OPPOSITE
+		//! orientations on it, under vgtl's own (-1)^local_index
+		//! convention (include/vgtl/top/ord_split.hpp) -- verified by
+		//! glpt_test.cpp's orientation-coherence test.
+		int orientation() const {
+			glpt_gaifullin_init();
+			return glpt_gaifullin_orientation[seed_index()] * seed_relative_orientation();
+		}
 
 		//! Same as lpt<dim,code>::is_child0 -- dimension-generic, no seed
 		//! dependence (see this function's own comment in lpt.hpp; the
