@@ -18,12 +18,19 @@
 //      on both sides -- this is the actual property the whole design
 //      depends on (see glpt_vertex_ids.hpp's own comment), checked
 //      directly rather than assumed.
+//   4. glpt_edge_cache's own insert/lookup/forget_edge churn against an
+//      independent std::map ground truth -- the actual correctness test
+//      for its open-addressing storage and backward-shift deletion
+//      (added 2026-09-23 when std::map was replaced with open addressing
+//      for memory reasons -- see that class's own comment; forget_edge()
+//      wasn't otherwise exercised by anything in this file).
 //
 // Build: g++ -std=c++11 -I. glpt_vertex_ids_test.cpp lpt.o -o glpt_vertex_ids_test
 
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <map>
 #include "glpt_vertex_ids.hpp"
 
 static int g_fail = 0;
@@ -157,10 +164,42 @@ void test_neighbor_id_consistency() {
 		n_checked, n_deep_skipped, cache.size(), cache.next_id()-GLPT_BASE_VERTEX_COUNT);
 }
 
+void test_edge_cache_churn() {
+	printf("--- test 4: glpt_edge_cache insert/lookup/forget churn vs std::map ground truth ---\n");
+	glpt_edge_cache cache;
+	std::map<std::pair<int,int>,int> truth;
+	srand(555);
+	int n_checked=0, n_mismatch=0;
+	for(int round=0; round<200000; ++round) {
+		int op = rand()%3;
+		int a = rand()%2000, b = rand()%2000;
+		if(a==b) continue;
+		int lo=a<b?a:b, hi=a<b?b:a;
+		if(op<2) {
+			int id = cache.get_or_create_midpoint(a,b);
+			std::map<std::pair<int,int>,int>::iterator it = truth.find(std::make_pair(lo,hi));
+			if(it==truth.end()) truth[std::make_pair(lo,hi)] = id;
+			else { ++n_checked; if(it->second!=id) ++n_mismatch; }
+		} else {
+			cache.forget_edge(a,b);
+			truth.erase(std::make_pair(lo,hi));
+		}
+	}
+	CHECK(n_mismatch==0, "glpt_edge_cache returned a different id for an already-cached edge");
+	CHECK(cache.size()==truth.size(), "glpt_edge_cache.size() disagrees with the independent ground truth");
+	int n_reverify_fail=0;
+	for(std::map<std::pair<int,int>,int>::iterator it=truth.begin(); it!=truth.end(); ++it)
+		if(cache.get_or_create_midpoint(it->first.first, it->first.second) != it->second) ++n_reverify_fail;
+	CHECK(n_reverify_fail==0, "a surviving edge no longer resolves to its own cached id");
+	printf("checked=%d mismatch=%d reverify_fail=%d cache.size()=%zu truth.size()=%zu\n",
+		n_checked, n_mismatch, n_reverify_fail, cache.size(), truth.size());
+}
+
 int main() {
 	test_vertex_weights_exact_sanity();
 	test_incremental_id_assignment();
 	test_neighbor_id_consistency();
+	test_edge_cache_churn();
 
 	printf("\n%s (%d failures)\n", g_fail==0 ? "ALL CHECKS PASSED" : "CHECKS FAILED", g_fail);
 	return g_fail==0 ? 0 : 1;

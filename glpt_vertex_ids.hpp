@@ -93,7 +93,8 @@
  */
 
 #include "glpt.hpp"
-#include <map>
+#include "glpt_hash_util.hpp"
+#include <cstdlib>
 
 // Gaifullin's 15 original points (gaifullin_points() in
 // riemann_cp2.cpp) -- every root cell's vertex ids, read directly off
@@ -103,45 +104,111 @@ static const int GLPT_BASE_VERTEX_COUNT = 15;
 // Maps a bisected edge (sorted pair of already-known vertex ids) to the
 // single canonical id of its midpoint, minting a fresh one (starting
 // just past the 15 base points) the first time any cell bisects that
-// edge. std::map for correctness/simplicity first -- the open-
-// addressing design discussed for the cell-existence table applies
-// here too if this ever needs to be faster, but a bisection only
-// touches this once per cell (not a hot inner loop), and map's O(log n)
-// isn't the bottleneck this design is aimed at (the O(1)-per-leaf
-// memory footprint, not lookup speed).
+// edge.
+//
+// Open addressing (glpt_tree.hpp's own design, reusing its hash/prime
+// helpers via glpt_hash_util.hpp), NOT std::map -- changed 2026-09-23
+// after directly measuring peak RSS of riemann_cp2_glpt.cpp against
+// riemann_cp2.cpp: at ~470000 leaves this table alone had ~470000
+// std::map nodes, each paying red-black-tree overhead (3 pointers +
+// color, ~32 bytes) on top of the 12 real payload bytes (uint64_t key +
+// int value) -- enough on its own to erase glpt_tree's whole per-leaf
+// memory saving over riemann_cp2.cpp's append-only nmt<4>. A slot here
+// is 16 bytes (key+value+bool, rounded up for alignment) with no tree
+// overhead at all.
 class glpt_edge_cache {
 	public:
-		glpt_edge_cache() : next_id_(GLPT_BASE_VERTEX_COUNT) {}
+		explicit glpt_edge_cache(size_t initial_buckets = 257)
+			: keys_(0), values_(0), present_(0), nbuckets_(0), count_(0), next_id_(GLPT_BASE_VERTEX_COUNT)
+		{
+			alloc_(glpt_next_prime(initial_buckets));
+		}
+		~glpt_edge_cache() { std::free(keys_); std::free(values_); std::free(present_); }
 
 		int get_or_create_midpoint(int a, int b) {
 			if(a>b) { int t=a; a=b; b=t; }
 			uint64_t key = (uint64_t(uint32_t(a))<<32) | uint32_t(b);
-			std::map<uint64_t,int>::iterator it = table_.find(key);
-			if(it!=table_.end()) return it->second;
+			size_t slot = find_slot_(key);
+			if(slot!=size_t(-1)) return values_[slot];
 			int id = next_id_++;
-			table_[key] = id;
+			insert_(key, id);
 			return id;
 		}
 
-		size_t size() const { return table_.size(); }
+		size_t size() const { return count_; }
 		int next_id() const { return next_id_; }
 
 		// Removal is a plain point-delete, not a sweep: the KEY of the
 		// entry that becomes obsolete when a cell bisects is exactly the
 		// (sorted parent-id pair) of the edge it just consumed -- known
-		// directly at that moment (user's suggestion, 2026-09-22).
-		// Provided for that future use; not called by anything here yet
-		// (see this file's own header comment on why growth is already
-		// bounded without it).
+		// directly at that moment (user's suggestion, 2026-09-22). A
+		// no-op if the edge isn't cached (matches std::map::erase's own
+		// by-key behavior). Provided for that future use; not called by
+		// anything here yet (see this file's own header comment on why
+		// growth is already bounded without it). Backward-shift, same
+		// derivation and same caveat as glpt_tree.hpp's own erase_() --
+		// see that function's comment for the bug an earlier, simpler
+		// (stop-at-first-non-mover) version of this exact algorithm had.
 		void forget_edge(int a, int b) {
 			if(a>b) { int t=a; a=b; b=t; }
 			uint64_t key = (uint64_t(uint32_t(a))<<32) | uint32_t(b);
-			table_.erase(key);
+			size_t gap = find_slot_(key);
+			if(gap==size_t(-1)) return;
+			size_t scan=gap;
+			while(true) {
+				scan=(scan+1)%nbuckets_;
+				if(!present_[scan]) break;
+				size_t ideal = glpt_hash64(keys_[scan]) % nbuckets_;
+				bool in_range = (gap<=scan) ? (ideal>gap && ideal<=scan) : (ideal>gap || ideal<=scan);
+				if(in_range) continue;
+				keys_[gap]=keys_[scan]; values_[gap]=values_[scan]; present_[gap]=true;
+				gap=scan;
+			}
+			present_[gap]=false;
+			--count_;
 		}
 
 	private:
-		std::map<uint64_t,int> table_;
+		uint64_t* keys_;
+		int* values_;
+		bool* present_;
+		size_t nbuckets_, count_;
 		int next_id_;
+
+		void alloc_(size_t n) {
+			keys_ = (uint64_t*)std::calloc(n,sizeof(uint64_t));
+			values_ = (int*)std::calloc(n,sizeof(int));
+			present_ = (bool*)std::calloc(n,sizeof(bool));
+			assert(keys_!=0 && values_!=0 && present_!=0 && "glpt_edge_cache: out of memory");
+			nbuckets_ = n;
+		}
+		size_t find_slot_(uint64_t key) const {
+			size_t h = glpt_hash64(key) % nbuckets_;
+			while(present_[h]) {
+				if(keys_[h]==key) return h;
+				h=(h+1)%nbuckets_;
+			}
+			return size_t(-1);
+		}
+		void grow_if_needed_() {
+			if(double(count_+1) <= 0.7*double(nbuckets_)) return;
+			uint64_t* old_k=keys_; int* old_v=values_; bool* old_p=present_;
+			size_t old_n=nbuckets_;
+			alloc_(glpt_next_prime(2*old_n));
+			count_=0;
+			for(size_t i=0;i<old_n;++i) if(old_p[i]) insert_(old_k[i], old_v[i]);
+			std::free(old_k); std::free(old_v); std::free(old_p);
+		}
+		void insert_(uint64_t key, int value) {
+			grow_if_needed_();
+			size_t h = glpt_hash64(key) % nbuckets_;
+			while(present_[h]) h=(h+1)%nbuckets_;
+			keys_[h]=key; values_[h]=value; present_[h]=true;
+			++count_;
+		}
+
+		glpt_edge_cache(const glpt_edge_cache&);
+		glpt_edge_cache& operator=(const glpt_edge_cache&);
 };
 
 // Root cell's vertex ids: directly glpt_gaifullin_cells[seed][k] --

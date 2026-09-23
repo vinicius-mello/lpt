@@ -102,30 +102,10 @@
  */
 
 #include "glpt.hpp"
+#include "glpt_hash_util.hpp"
 #include <cstdlib>
 #include <set>
 #include <vector>
-
-static inline uint64_t glpt_tree_hash(uint64_t x) {
-	// Same splitmix64-style avalanche as ~/code/lua/lpt/hash.c's lpt_hash.
-	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
-	x = (x ^ (x >> 27)) * 0x94d049b13c66a8edull;
-	x = x ^ (x >> 31);
-	return x;
-}
-
-static inline bool glpt_tree_is_prime(size_t n) {
-	if(n<2) return false;
-	if(n%2==0) return n==2;
-	for(size_t d=3; d*d<=n; d+=2) if(n%d==0) return false;
-	return true;
-}
-static inline size_t glpt_tree_next_prime(size_t n) {
-	if(n<3) return 3;
-	size_t c = (n%2==0) ? (n+1) : n;
-	while(!glpt_tree_is_prime(c)) c += 2;
-	return c;
-}
 
 class glpt_tree {
 	public:
@@ -134,7 +114,7 @@ class glpt_tree {
 		explicit glpt_tree(size_t initial_buckets = 257)
 			: slots_(0), nbuckets_(0), count_(0)
 		{
-			alloc_(glpt_tree_next_prime(initial_buckets));
+			alloc_(glpt_next_prime(initial_buckets));
 		}
 		~glpt_tree() { std::free(slots_); }
 
@@ -349,7 +329,7 @@ class glpt_tree {
 		}
 
 		size_t find_slot_(uint64_t code) const {
-			size_t h = glpt_tree_hash(code) % nbuckets_;
+			size_t h = glpt_hash64(code) % nbuckets_;
 			while(slots_[h]!=0) {
 				if((slots_[h] & ~PRESENT_BIT) == code) return h;
 				h = (h+1) % nbuckets_;
@@ -361,7 +341,7 @@ class glpt_tree {
 			if(double(count_+1) <= 0.7*double(nbuckets_)) return;
 			size_t old_n = nbuckets_;
 			uint64_t* old = slots_;
-			alloc_(glpt_tree_next_prime(2*old_n));
+			alloc_(glpt_next_prime(2*old_n));
 			size_t old_count = count_;
 			count_ = 0;
 			for(size_t i=0;i<old_n;++i)
@@ -373,7 +353,7 @@ class glpt_tree {
 		void insert_(uint64_t code) {
 			assert(find_slot_(code)==size_t(-1) && "glpt_tree: inserting a code that's already present");
 			grow_if_needed_();
-			size_t h = glpt_tree_hash(code) % nbuckets_;
+			size_t h = glpt_hash64(code) % nbuckets_;
 			while(slots_[h]!=0) h = (h+1) % nbuckets_;
 			slots_[h] = code | PRESENT_BIT;
 			++count_;
@@ -403,7 +383,7 @@ class glpt_tree {
 				scan = (scan+1) % nbuckets_;
 				if(slots_[scan]==0) break;
 				uint64_t scan_code = slots_[scan] & ~PRESENT_BIT;
-				size_t ideal = glpt_tree_hash(scan_code) % nbuckets_;
+				size_t ideal = glpt_hash64(scan_code) % nbuckets_;
 				if(cyclic_in_range_(gap, ideal, scan)) {
 					// this entry's own probe path doesn't reach back
 					// through gap -- leave it, keep scanning (gap stays).
