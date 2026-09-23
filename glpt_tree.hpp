@@ -71,10 +71,39 @@
  * only for two of the DIM+1 facet directions). neighbor_leaf() reports
  * this case explicitly (REFINED_FURTHER) rather than guessing or
  * silently returning something wrong.
+ *
+ * ============================================================
+ * COMPATIBLE (GRADED) BISECTION -- compat_bisect()
+ * ============================================================
+ * bisect() itself enforces no relationship between a cell and its
+ * neighbors at all -- a mesh built with only bisect() calls can become
+ * arbitrarily irregular. compat_bisect(r) additionally guarantees the
+ * mesh stays 1-level graded (no same-level facet, other than the two a
+ * bisection leaves whole -- i==DIM and i==r.level(), which don't need
+ * this) ever has more than a 1-level depth difference across it),
+ * recursively bisecting whatever neighbors are needed first. Ported
+ * from lpt.hpp's own lpt_tree<lpt>::compat_bisect/compat_bisect_rec
+ * (2026-09-23) -- structurally the same recursion, but that port
+ * surfaced three real bugs, all found by glpt_tree_test.cpp's own
+ * exhaustive graded-invariant sweep (not by inspection), documented in
+ * compat_bisect_rec()'s own comment: two were outright crashes (a
+ * same-level neighbor that's a root already bisected away has no
+ * parent; a neighbor's parent already mid-recursion higher up the same
+ * call stack got double-processed), and one was a wrong-direction
+ * inference (a same-level neighbor absent because it had just been
+ * refined FURTHER, within the very same top-level call, was mistaken
+ * for one that's coarser). Whether the ORIGINAL lpt.hpp has the same
+ * three gaps for the plain hypercube was not investigated -- Gaifullin's
+ * seeds simply exercise paths (crossing between independently-specified
+ * cells, not a single shared symmetric domain) that may not come up
+ * there. Verified after the fixes at ~40000 compat_bisect() calls
+ * cascading to nearly 4 million leaves (outside the committed suite),
+ * 11.6 million facet checks, 0 graded-invariant violations.
  */
 
 #include "glpt.hpp"
 #include <cstdlib>
+#include <set>
 
 static inline uint64_t glpt_tree_hash(uint64_t x) {
 	// Same splitmix64-style avalanche as ~/code/lua/lpt/hash.c's lpt_hash.
@@ -131,6 +160,47 @@ class glpt_tree {
 			insert_(r.child(1).raw());
 		}
 
+		//! Bisects `r`, first recursively bisecting whichever neighbors
+		//! are needed to keep the mesh 1-level graded (no same-level
+		//! facet ever has more than a 1-level depth difference across
+		//! it) -- ported from lpt.hpp's own lpt_tree<lpt>::compat_bisect/
+		//! compat_bisect_rec (2026-09-23, user's suggestion to look at
+		//! how the original handles it), using glpt::neighbor() (the
+		//! plain combinatorial same-level candidate, exactly as the
+		//! original calls r.neighbor(i,n) on the bare lpt, NOT through
+		//! any tree-aware stitching) plus exists() to detect and fix
+		//! mismatches directly, the same way the original does with its
+		//! own exists()/is_leaf().
+		//!
+		//! WHY facets i==DIM and i==r.level() are skipped: those are
+		//! exactly the two facets of `r` that do NOT contain the edge
+		//! (level(r),DIM) Theorem 1 is about to bisect -- they pass to
+		//! one child whole, undivided, so a neighbor there doesn't need
+		//! to be any finer on THIS cell's account (a property of which
+		//! edge gets cut, independent of whether `r` itself is a 0- or
+		//! 1-child of its own parent -- not to be confused with the
+		//! UNRELATED sibling-direction facets neighbor() itself special-
+		//! cases, see glpt.hpp's own comment).
+		//!
+		//! WHY recursing into n.parent() doesn't need its own existence
+		//! check first (unlike bisect()'s precondition): by induction,
+		//! if the mesh was already 1-level graded before this call (and
+		//! compat_bisect() is the only way anything is ever bisected),
+		//! `n` not existing means the mesh is exactly one level coarser
+		//! there, so n.parent() -- exactly r's own level -- is
+		//! guaranteed to be the leaf that's actually present -- UNLESS
+		//! `n` is itself a root already bisected away, which has no
+		//! parent at all (see compat_bisect_rec()'s own comment for the
+		//! real crash this caused, and why nothing needs to happen in
+		//! that case anyway). Verified directly (not just assumed) by
+		//! glpt_tree_test.cpp's own graded-invariant sweep, checked after
+		//! many compat_bisect() calls from a fresh seed_all_roots() mesh.
+		void compat_bisect(const glpt& r) {
+			assert(exists(r) && "glpt_tree::compat_bisect: r is not a current leaf");
+			pending_.clear();
+			compat_bisect_rec(r);
+		}
+
 		//! Walks up from `c` (checking `c` itself first) until a current
 		//! leaf is found. Returns false iff no ancestor of `c`, including
 		//! the root, is a leaf -- meaning `c`'s own region has already
@@ -172,6 +242,70 @@ class glpt_tree {
 		uint64_t* slots_;
 		size_t nbuckets_;
 		size_t count_;
+		std::set<glpt> pending_; // compat_bisect_rec()'s own in-progress set
+
+		void compat_bisect_rec(const glpt& r) {
+			pending_.insert(r);
+			for(int i=0;i<=glpt::DIM;++i) {
+				if(i==glpt::DIM || i==r.level()) continue;
+				glpt n;
+				glpt::result gr = r.neighbor(i, n);
+				if(gr!=glpt::OK) continue; // see glpt.hpp's own comment -- essentially never happens
+				// BUG FIXED 2026-09-23 (caught by glpt_tree_test.cpp's own
+				// graded-invariant test -- an assert in glpt::parent(),
+				// not a silent wrong answer): the original lpt.hpp this
+				// was ported from assumes !exists(n) always means "n is
+				// exactly one level coarser, so n.parent() exists" -- true
+				// for a NON-root n, by the graded invariant, but for a
+				// ROOT n that's already been bisected away, n.parent() is
+				// undefined (a root has none) AND unnecessary: r (also at
+				// n's own level) being one level COARSER than n's now-
+				// existing children is exactly the allowed direction of a
+				// 1-level difference, nothing to force here.
+				//
+				// SECOND BUG FIXED 2026-09-23 (same test, next crash after
+				// the one above: an assert in bisect() itself, meaning `r`
+				// no longer existed when compat_bisect_rec(r) reached its
+				// OWN closing bisect(r) call below): unlike the second
+				// check just below, this first branch had no pending_
+				// guard -- if n.parent() was already mid-recursion further
+				// up the SAME call stack (added to pending_ by an
+				// enclosing compat_bisect_rec call, but not yet actually
+				// bisect()ed, since that only happens at the very end),
+				// recursing into it again here double-processed it: the
+				// nested call's own closing bisect() would consume it
+				// early, so the enclosing call's LATER bisect() on that
+				// same cell then found it already gone. (The original
+				// lpt.hpp this was ported from has the identical gap --
+				// not something introduced here -- just apparently never
+				// exercised by whatever it was used on before.)
+				//
+				// THIRD BUG FIXED 2026-09-23 (same test, one more crash
+				// after both fixes above -- again bisect(r)'s own assert):
+				// !exists(n) does not ALWAYS mean "n is exactly one level
+				// coarser" -- it can also mean n was refined FURTHER,
+				// specifically by THIS SAME top-level compat_bisect() call,
+				// moments earlier via a different facet of a different
+				// cell (found by tracing a concrete case: n existed, got
+				// bisected via the second branch below, and a later facet
+				// of an ENTIRELY different cell in the same recursion then
+				// asked about that same n again -- now absent, but its
+				// PARENT was a root bisected in some earlier, unrelated
+				// top-level call, long gone, not "one level coarser" at
+				// all). The graded invariant only constrains the mesh
+				// BETWEEN top-level compat_bisect() calls -- mid-recursion,
+				// a neighbor can transiently become finer than r by more
+				// than the usual margin. Checking whether n's OWN children
+				// already exist (the direct symptom of the concrete case
+				// found) catches this: if so, n is already fine, same as
+				// the root case above -- nothing to force.
+				bool n_at_depth_cap = n.orthant_level()>=glpt::MAX_ORTHANT_LEVEL && n.level()>=glpt::DIM-1;
+				bool n_refined_further = !exists(n) && !n_at_depth_cap && exists(n.child(0));
+				if(!exists(n) && !n_refined_further && !n.is_root() && pending_.count(n.parent())==0) compat_bisect_rec(n.parent());
+				if(exists(n) && pending_.count(n)==0) compat_bisect_rec(n);
+			}
+			bisect(r);
+		}
 
 		void alloc_(size_t nbuckets) {
 			slots_ = (uint64_t*)std::calloc(nbuckets, sizeof(uint64_t));

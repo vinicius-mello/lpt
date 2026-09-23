@@ -14,12 +14,21 @@
 //      is itself a leaf; REFINED_FURTHER once it's bisected; and the
 //      finer side (either child) can find its way back to the coarser
 //      leaf via SOME facet index -- checked directly, not assumed.
+//   4. compat_bisect(): after many compat_bisect()-only operations on a
+//      growing mesh, exhaustively checks the 1-level-graded invariant
+//      it's supposed to maintain -- for EVERY current leaf and EVERY
+//      non-skipped facet, the same-level neighbor candidate is at most
+//      one parent() step from an existing leaf. Ported from lpt.hpp's
+//      own lpt_tree<lpt>::compat_bisect/compat_bisect_rec; this test is
+//      the actual verification that the port is correct for Gaifullin's
+//      seeds too, not just assumed from the hypercube case.
 //
 // Build: g++ -std=c++11 -I. glpt_tree_test.cpp lpt.o -o glpt_tree_test
 
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <vector>
 #include "glpt_tree.hpp"
 
 static int g_fail = 0;
@@ -169,10 +178,66 @@ void test_neighbor_leaf_transitions() {
 		n_found_direct, n_refined_further, n_finer_side_roundtrip_ok, n_finer_side_roundtrip_checked);
 }
 
+void test_compat_bisect() {
+	printf("--- test 4: compat_bisect() maintains the 1-level-graded invariant ---\n");
+	glpt_tree tree;
+	tree.seed_all_roots();
+	srand(135791);
+
+	std::vector<uint64_t> leaves;
+	struct Collector { std::vector<uint64_t>* out; void operator()(const glpt& c) const { out->push_back(c.raw()); } };
+	for(int s=0;s<GLPT_NCELLS;++s) leaves.push_back(glpt(s).raw());
+
+	int n_ops=0, n_skipped=0;
+	for(int round=0; round<4000; ++round) {
+		if(round%50==0) {
+			leaves.clear();
+			Collector col; col.out=&leaves;
+			tree.for_each_leaf(col);
+		}
+		int idx = rand() % (int)leaves.size();
+		glpt r = glpt::from_raw(leaves[idx]);
+		if(!tree.exists(r)) { ++n_skipped; continue; } // consumed by an earlier round's own recursion
+		if(r.orthant_level()>=glpt::MAX_ORTHANT_LEVEL-2) { ++n_skipped; continue; } // stay clear of the depth cap
+		tree.compat_bisect(r);
+		++n_ops;
+	}
+	printf("compat_bisect() calls=%d skipped=%d final leaf_count=%zu\n", n_ops, n_skipped, tree.leaf_count());
+
+	// The actual invariant check: for EVERY current leaf and EVERY facet
+	// index compat_bisect() actually guarantees gradedness for (i.e. NOT
+	// i==DIM or i==L.level() -- see compat_bisect()'s own comment on
+	// what it deliberately does not cover), the same-level neighbor
+	// candidate must be at most one parent() step from an existing leaf.
+	std::vector<uint64_t> final_leaves;
+	Collector col; col.out=&final_leaves;
+	tree.for_each_leaf(col);
+	long n_checked=0, n_violations=0;
+	for(size_t li=0; li<final_leaves.size(); ++li) {
+		glpt L = glpt::from_raw(final_leaves[li]);
+		for(int i=0;i<=glpt::DIM;++i) {
+			if(i==glpt::DIM || i==L.level()) continue;
+			glpt n;
+			glpt::result gr = L.neighbor(i, n);
+			if(gr!=glpt::OK) continue;
+			++n_checked;
+			bool ok = tree.exists(n) || (!n.is_root() && tree.exists(n.parent()));
+			if(!ok) {
+				++n_violations;
+				if(n_violations<=5) printf("VIOLATION: leaf level=%d orthlvl=%d seed=%d i=%d -- neighbor and its parent both missing\n",
+					L.level(), L.orthant_level(), L.seed_index(), i);
+			}
+		}
+	}
+	CHECK(n_violations==0, "compat_bisect() left the mesh more than 1 level ungraded somewhere");
+	printf("graded-invariant check: %ld facet checks, %ld violations\n", n_checked, n_violations);
+}
+
 int main() {
 	test_basic_seed_bisect();
 	test_heavy_churn();
 	test_neighbor_leaf_transitions();
+	test_compat_bisect();
 
 	printf("\n%s (%d failures)\n", g_fail==0 ? "ALL CHECKS PASSED" : "CHECKS FAILED", g_fail);
 	return g_fail==0 ? 0 : 1;
