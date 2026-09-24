@@ -101,19 +101,6 @@
 // glpt_gaifullin_cells[seed], already lie in this range.
 static const int GLPT_BASE_VERTEX_COUNT = 15;
 
-// Vertex ids are stored packed into 20 bits wherever a cache needs them
-// (here, and in vgtl2.0's riemann_cp2_glpt/glpt_crossing.hpp's face
-// cache) -- user's suggestion, 2026-09-23, after measuring vertex
-// counts against leaf counts directly (71196 vertices at 1461588 leaves,
-// --depth 16 on the conic curve): 2^20=1048576 gives roughly 15x that
-// much headroom, comfortably past any depth this project has actually
-// reached, while being small enough to pack THREE ids plus a value into
-// one 64-bit word. GLPT_VERTEX_ID_BITS/MASK are the shared contract
-// between the two caches; asserts below catch it loudly (not silent
-// truncation) if a mesh ever actually mints more ids than that.
-static const int GLPT_VERTEX_ID_BITS = 20;
-static const uint64_t GLPT_VERTEX_ID_MASK = (uint64_t(1)<<GLPT_VERTEX_ID_BITS)-1;
-
 // Maps a bisected edge (sorted pair of already-known vertex ids) to the
 // single canonical id of its midpoint, minting a fresh one (starting
 // just past the 15 base points) the first time any cell bisects that
@@ -124,37 +111,39 @@ static const uint64_t GLPT_VERTEX_ID_MASK = (uint64_t(1)<<GLPT_VERTEX_ID_BITS)-1
 // after directly measuring peak RSS of riemann_cp2_glpt.cpp against
 // riemann_cp2.cpp: at ~470000 leaves this table alone had ~470000
 // std::map nodes, each paying red-black-tree overhead (3 pointers +
-// color, ~32 bytes) on top of the real payload -- enough on its own to
-// erase glpt_tree's whole per-leaf memory saving over riemann_cp2.cpp's
-// append-only nmt<4>.
+// color, ~32 bytes) on top of the 12 real payload bytes (uint64_t key +
+// int value) -- enough on its own to erase glpt_tree's whole per-leaf
+// memory saving over riemann_cp2.cpp's append-only nmt<4>. A slot here
+// is 16 bytes (key+value+bool, rounded up for alignment) with no tree
+// overhead at all.
 //
-// A slot is a SINGLE uint64_t (8 bytes, no separate key/value/present
-// arrays): bit 63 = present, bits [40,60) = a, bits [20,40) = b, bits
-// [0,20) = the cached id -- since ids fit in 20 bits (see above), (a,b,
-// id) together need only 60 of the 64 bits, with room to spare for the
-// present flag, exactly the trick glpt_tree.hpp's own PRESENT_BIT
-// already uses (there because glpt itself has 2 spare bits out of 64;
-// here because 20-bit ids leave far more room than that).
+// REVERTED 2026-09-24 from a briefer 20-bit-id-packed single-uint64_t/
+// slot design (5cb237d): that packing assumed vertex ids would never
+// exceed 2^20-1=1048575, calibrated from a --depth 16 conic measurement
+// (71196 vertices) -- a real, user-triggered mesh (elliptic,
+// --generic-seed, --depth 20 --threshold 0.02) minted past that and hit
+// the packing's own loud assertion rather than silently corrupting
+// data. Full 32-bit ids (via a plain uint32_t-range key, not packed
+// alongside the value) remove that ceiling entirely -- keys_ below
+// packs (a,b) into one uint64_t (32 bits each, exact, no truncation),
+// with the minted id and the present flag in their own separate arrays
+// instead of squeezed into the same word.
 class glpt_edge_cache {
 	public:
-		static const uint64_t PRESENT_BIT = uint64_t(1)<<63;
-		static const uint64_t KEY_MASK = (((uint64_t(1)<<60)-1) & ~GLPT_VERTEX_ID_MASK); // bits [20,60)
-
 		explicit glpt_edge_cache(size_t initial_buckets = 257)
-			: slots_(0), nbuckets_(0), count_(0), next_id_(GLPT_BASE_VERTEX_COUNT)
+			: keys_(0), values_(0), present_(0), nbuckets_(0), count_(0), next_id_(GLPT_BASE_VERTEX_COUNT)
 		{
 			alloc_(glpt_next_prime(initial_buckets));
 		}
-		~glpt_edge_cache() { std::free(slots_); }
+		~glpt_edge_cache() { std::free(keys_); std::free(values_); std::free(present_); }
 
 		int get_or_create_midpoint(int a, int b) {
 			if(a>b) { int t=a; a=b; b=t; }
-			assert_id_(a); assert_id_(b);
-			size_t slot = find_slot_(a,b);
-			if(slot!=size_t(-1)) return int(slots_[slot] & GLPT_VERTEX_ID_MASK);
+			uint64_t key = (uint64_t(uint32_t(a))<<32) | uint32_t(b);
+			size_t slot = find_slot_(key);
+			if(slot!=size_t(-1)) return values_[slot];
 			int id = next_id_++;
-			assert_id_(id);
-			insert_(a, b, id);
+			insert_(key, id);
 			return id;
 		}
 
@@ -174,77 +163,59 @@ class glpt_edge_cache {
 		// (stop-at-first-non-mover) version of this exact algorithm had.
 		void forget_edge(int a, int b) {
 			if(a>b) { int t=a; a=b; b=t; }
-			size_t gap = find_slot_(a,b);
+			uint64_t key = (uint64_t(uint32_t(a))<<32) | uint32_t(b);
+			size_t gap = find_slot_(key);
 			if(gap==size_t(-1)) return;
 			size_t scan=gap;
 			while(true) {
 				scan=(scan+1)%nbuckets_;
-				if(slots_[scan]==0) break;
-				size_t ideal = hash_of_slot_(slots_[scan]) % nbuckets_;
+				if(!present_[scan]) break;
+				size_t ideal = glpt_hash64(keys_[scan]) % nbuckets_;
 				bool in_range = (gap<=scan) ? (ideal>gap && ideal<=scan) : (ideal>gap || ideal<=scan);
 				if(in_range) continue;
-				slots_[gap]=slots_[scan];
+				keys_[gap]=keys_[scan]; values_[gap]=values_[scan]; present_[gap]=true;
 				gap=scan;
 			}
-			slots_[gap]=0;
+			present_[gap]=false;
 			--count_;
 		}
 
 	private:
-		uint64_t* slots_;
+		uint64_t* keys_;
+		int* values_;
+		bool* present_;
 		size_t nbuckets_, count_;
 		int next_id_;
 
-		static void assert_id_(int id) {
-			assert(id>=0 && uint64_t(id)<=GLPT_VERTEX_ID_MASK
-				&& "glpt_edge_cache: a vertex id exceeds the 20-bit capacity -- this mesh genuinely "
-				   "needs GLPT_VERTEX_ID_BITS raised (see glpt_vertex_ids.hpp's own comment)");
-			(void)id;
-		}
-		static uint64_t pack_(int a, int b, int value) {
-			return PRESENT_BIT | (uint64_t(uint32_t(a))<<40) | (uint64_t(uint32_t(b))<<20) | uint64_t(uint32_t(value));
-		}
-		static uint64_t key_bits_(int a, int b) {
-			return (uint64_t(uint32_t(a))<<40) | (uint64_t(uint32_t(b))<<20);
-		}
-		static uint64_t hash_of_slot_(uint64_t slot) {
-			return glpt_hash64(slot & KEY_MASK);
-		}
-
 		void alloc_(size_t n) {
-			slots_ = (uint64_t*)std::calloc(n,sizeof(uint64_t));
-			assert(slots_!=0 && "glpt_edge_cache: out of memory");
+			keys_ = (uint64_t*)std::calloc(n,sizeof(uint64_t));
+			values_ = (int*)std::calloc(n,sizeof(int));
+			present_ = (bool*)std::calloc(n,sizeof(bool));
+			assert(keys_!=0 && values_!=0 && present_!=0 && "glpt_edge_cache: out of memory");
 			nbuckets_ = n;
 		}
-		size_t find_slot_(int a, int b) const {
-			uint64_t target = key_bits_(a,b);
-			size_t h = glpt_hash64(target) % nbuckets_;
-			while(slots_[h]!=0) {
-				if((slots_[h] & KEY_MASK) == target) return h;
+		size_t find_slot_(uint64_t key) const {
+			size_t h = glpt_hash64(key) % nbuckets_;
+			while(present_[h]) {
+				if(keys_[h]==key) return h;
 				h=(h+1)%nbuckets_;
 			}
 			return size_t(-1);
 		}
 		void grow_if_needed_() {
 			if(double(count_+1) <= 0.7*double(nbuckets_)) return;
-			uint64_t* old = slots_;
+			uint64_t* old_k=keys_; int* old_v=values_; bool* old_p=present_;
 			size_t old_n=nbuckets_;
 			alloc_(glpt_next_prime(2*old_n));
 			count_=0;
-			for(size_t i=0;i<old_n;++i) if(old[i]!=0) {
-				int a=int((old[i]>>40)&GLPT_VERTEX_ID_MASK);
-				int b=int((old[i]>>20)&GLPT_VERTEX_ID_MASK);
-				int v=int(old[i]&GLPT_VERTEX_ID_MASK);
-				insert_(a,b,v);
-			}
-			std::free(old);
+			for(size_t i=0;i<old_n;++i) if(old_p[i]) insert_(old_k[i], old_v[i]);
+			std::free(old_k); std::free(old_v); std::free(old_p);
 		}
-		void insert_(int a, int b, int value) {
+		void insert_(uint64_t key, int value) {
 			grow_if_needed_();
-			uint64_t packed = pack_(a,b,value);
-			size_t h = glpt_hash64(packed & KEY_MASK) % nbuckets_;
-			while(slots_[h]!=0) h=(h+1)%nbuckets_;
-			slots_[h]=packed;
+			size_t h = glpt_hash64(key) % nbuckets_;
+			while(present_[h]) h=(h+1)%nbuckets_;
+			keys_[h]=key; values_[h]=value; present_[h]=true;
 			++count_;
 		}
 
