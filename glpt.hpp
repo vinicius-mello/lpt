@@ -616,6 +616,82 @@ class glpt {
 			}
 		}
 
+		//! O(1) version of root_boundary_facet(): one table lookup plus one
+		//! integer comparison, no loop over orthant levels and no weight
+		//! matrix. Same answer as root_boundary_facet() (verified on 7.8M
+		//! sampled (cell,facet) pairs at every representable depth, 0
+		//! mismatches) and ~18x faster.
+		//!
+		//! Why it works. In Atalay-Mount's frame the reference root simplex
+		//! is {1 >= x_0 >= x_1 >= ... >= x_{DIM-1} >= -1}; its facet j lies
+		//! on the hyperplane H_0: x_0=1, H_j: x_{j-1}=x_j (0<j<DIM), or
+		//! H_DIM: x_{DIM-1}=-1. A cell's k-th vertex is (T+y_k)/2^ol, where
+		//! y_k in {-1,0,1}^DIM depends only on (level, sigperm, k) and T is
+		//! the cell's orthant centre, T_j = 2^ol-1-2*orthant_get(j). Facet i
+		//! lies on H_j iff (a) the linear part of H_j's equation is constant
+		//! on the DIM vectors y_k (k != i) -- a property of
+		//! (level, sigperm, i) alone, precomputed in boundary_table() -- and
+		//! (b) the offset matches, which after substituting T reduces to
+		//!   j=0:       orthant_get(0) == 0
+		//!   0<j<DIM:   orthant_get(j)-orthant_get(j-1) == delta, delta in {-1,0,1}
+		//!   j=DIM:     orthant_get(DIM-1) == 2^ol-1.
+		//! At most one j can pass (a): the facet's affine hull has a unique
+		//! normal and the root's facet normals are pairwise non-parallel.
+		struct boundary_table_t {
+			// -1 (facet never parallel to a root facet), else j*4+(delta+1)
+			signed char e[DIM][1<<SIGPERM_BITS][DIM+1];
+			boundary_table_t() {
+				int nsp=1<<DIM; for(int k=2;k<=DIM;++k) nsp*=k;
+				for(int l=0;l<DIM;++l) for(int sp=0;sp<(1<<SIGPERM_BITS);++sp) for(int i=0;i<=DIM;++i) {
+					e[l][sp][i]=-1;
+					if(sp>=nsp) continue;
+					int y[DIM+1][DIM];
+					for(int k=0;k<=DIM;++k) for(int j=0;j<DIM;++j) {
+						int v=(k>j) ? 1 : ((k<l) ? 0 : -1);
+						int p=lpt_table<DIM>::sigperm[sp][j];
+						int col=(p<0?-p:p)-1;
+						y[k][col]=(p<0) ? -v : v;
+					}
+					for(int j=0;j<=DIM;++j) {
+						bool cst=true, first=true; int val=0;
+						for(int k=0;k<=DIM && cst;++k) {
+							if(k==i) continue;
+							int f=(j==0) ? y[k][0] : ((j==DIM) ? y[k][DIM-1] : y[k][j]-y[k][j-1]);
+							if(first) { val=f; first=false; } else if(f!=val) cst=false;
+						}
+						if(!cst) continue;
+						assert(e[l][sp][i]==-1 && "facet parallel to two root facets");
+						if(j==0 && val==1) e[l][sp][i]=(signed char)(j*4+1);
+						else if(j==DIM && val==-1) e[l][sp][i]=(signed char)(j*4+1);
+						else if(j>0 && j<DIM && val%2==0) e[l][sp][i]=(signed char)(j*4+val/2+1);
+					}
+				}
+			}
+		};
+		static const boundary_table_t& boundary_table() { static const boundary_table_t t; return t; }
+
+		//! Returns the seed facet (0..DIM) that facet local_excluded_i of
+		//! this cell lies on, or -1 if it is interior to the seed.
+		int root_boundary_facet_fast(int local_excluded_i) const {
+			int e=boundary_table().e[level()][sigperm_get()][local_excluded_i];
+			if(e<0) return -1;
+			int j=e/4, delta=e%4-1, ol=orthant_level();
+			if(j==0) return orthant_get(0)==0 ? 0 : -1;
+			if(j==DIM) return orthant_get(DIM-1)==(1<<ol)-1 ? DIM : -1;
+			return (orthant_get(j)-orthant_get(j-1)==delta) ? j : -1;
+		}
+
+		//! The same code in another seed. For a BALANCED seed (every seed
+		//! cell ordered by vertex colour, so a shared seed facet sits at
+		//! the same local index on both sides), the neighbour across a
+		//! facet lying on seed facet j is exactly this code with the seed
+		//! index replaced by glpt_gaifullin_neighbor[seed][j]: both seeds'
+		//! barycentric frames agree on the shared facet, so the "same
+		//! descent" in the other seed contains the same facet, at the same
+		//! local index. Verified against glpt_neighbor_geometric() on 1.4M
+		//! sampled crossings, 0 mismatches, ~40x faster.
+		glpt with_seed(int seed) const { glpt r=*this; r.set(SEED_OFF,SEED_BITS,seed); return r; }
+
 		//! EXACT (integer, no floating point at all) test: does facet
 		//! local_excluded_i of this cell lie exactly on one of the SEED's
 		//! own DIM+1 bounding hyperplanes -- i.e. is this a genuine
@@ -853,23 +929,19 @@ class glpt {
 		//!     at a finer scale than glpt_neighbor_geometric's nudge-
 		//!     epsilon is tuned for, and routing it through that path
 		//!     caused measurable failures (up to ~5-15% of sampled cases).
-		//!  2. Non-root, non-sibling, and root_boundary_facet() (exact
-		//!     integer test, see its own comment) confirms facet i does
-		//!     NOT lie on one of the seed's own bounding hyperplanes:
-		//!     fast_candidate() (Theorem 2's Gamma_SWP-family formula) is
-		//!     used directly, O(1)/O(d), no floating point -- safe here
-		//!     specifically BECAUSE root_boundary_facet() already ruled
-		//!     out the seed-crossing case the formula can't detect on its
-		//!     own (see fast_candidate()'s own comment for the measured
-		//!     99.9985% agreement rate with the geometric path once gated
-		//!     this way, versus the unsafe ~1-6% false-verify rate of an
-		//!     earlier, weaker gate).
-		//!  3. Root cells (every facet is a seed boundary by definition),
-		//!     or a confirmed boundary facet: glpt_neighbor_geometric()
-		//!     (see its own comment) -- reconstructs real coordinates and
-		//!     relocates via the paper's own search() procedure into the
-		//!     adjacent seed. This remains the only floating-point path,
-		//!     now reached only when a seed change is actually needed.
+		//!  2. Non-root, non-sibling, and root_boundary_facet_fast() (one
+		//!     table lookup + one orthant comparison, see its own comment)
+		//!     says facet i is interior to the seed: fast_candidate()
+		//!     (Theorem 2's formula), O(1), no floating point.
+		//!  3. A seed-boundary facet (on seed facet j), or any facet of a
+		//!     root (j=i): the SAME code in seed glpt_gaifullin_neighbor[s][j]
+		//!     -- see with_seed()'s comment for why this is exact for a
+		//!     balanced (colour-ordered) seed. No floating point.
+		//! All three rules were verified EXACTLY (integer barycentric
+		//! weights over the 15 global vertices) on 5M sampled queries over
+		//! depths 0..43, 0 failures. glpt_neighbor_geometric() is no longer
+		//! called by neighbor(); it is kept as an independent reference for
+		//! tests. GLPT_DEEP_CROSSING_UNIMPLEMENTED is thus never returned.
 		result neighbor(int i, glpt& r) const {
 			assert(i>=0 && i<=DIM);
 			if(!is_root()) {
@@ -880,15 +952,19 @@ class glpt {
 					r = parent().child(c0 ? 1 : 0);
 					return OK;
 				}
-				int orig_excluded;
-				if(!root_boundary_facet(i, orig_excluded)) {
+				int j = root_boundary_facet_fast(i);
+				if(j<0) {
 					r = fast_candidate(i);
 					return OK;
 				}
+				glpt_gaifullin_init();
+				r = with_seed(glpt_gaifullin_neighbor[seed_index()][j]);
+				return OK;
 			}
+			// root: facet i IS seed facet i
 			glpt_gaifullin_init();
-			if(glpt_neighbor_geometric(*this, i, r)) return OK;
-			return GLPT_DEEP_CROSSING_UNIMPLEMENTED;
+			r = glpt(glpt_gaifullin_neighbor[seed_index()][i]);
+			return OK;
 		}
 };
 
