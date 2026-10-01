@@ -99,7 +99,7 @@
 // Gaifullin's 15 original points (gaifullin_points() in
 // riemann_cp2.cpp) -- every root cell's vertex ids, read directly off
 // glpt_gaifullin_cells[seed], already lie in this range.
-static const int GLPT_BASE_VERTEX_COUNT = 15;
+static const int GLPT_BASE_VERTEX_COUNT = 15; // Gaifullin; the ACTIVE seed's count is glpt_seed_vertex_count()
 
 // Maps a bisected edge (sorted pair of already-known vertex ids) to the
 // single canonical id of its midpoint, minting a fresh one (starting
@@ -131,7 +131,7 @@ static const int GLPT_BASE_VERTEX_COUNT = 15;
 class glpt_edge_cache {
 	public:
 		explicit glpt_edge_cache(size_t initial_buckets = 257)
-			: keys_(0), values_(0), present_(0), nbuckets_(0), count_(0), next_id_(GLPT_BASE_VERTEX_COUNT)
+			: keys_(0), values_(0), present_(0), nbuckets_(0), count_(0), next_id_(glpt_seed_vertex_count())
 		{
 			alloc_(glpt_next_prime(initial_buckets));
 		}
@@ -226,7 +226,7 @@ class glpt_edge_cache {
 // Root cell's vertex ids: directly glpt_gaifullin_cells[seed][k] --
 // already global ids (0..14) by definition, no cache lookup needed.
 inline void glpt_root_vertex_ids(int seed, int ids[glpt::DIM+1]) {
-	for(int k=0;k<=glpt::DIM;++k) ids[k] = glpt_gaifullin_cells[seed][k];
+	for(int k=0;k<=glpt::DIM;++k) ids[k] = glpt_seed_cells[seed][k];
 }
 
 // Child (zo=0 or 1) vertex ids, given the PARENT's (already-known) ids.

@@ -118,13 +118,14 @@ class glpt_tree {
 		}
 		~glpt_tree() { std::free(slots_); }
 
-		//! Seeds the mesh with all 108 Gaifullin root cells as leaves --
+		//! Seeds the mesh with all root cells of the active seed (Gaifullin's
+		//! 108 by default, see glpt_set_seed()) as leaves --
 		//! the natural starting point for a whole-CP^2 mesh. Call once,
 		//! before any bisect()/exists() (glpt_gaifullin_init() itself is
 		//! idempotent and cheap, called here for convenience).
 		void seed_all_roots() {
-			glpt_gaifullin_init();
-			for(int s=0;s<GLPT_NCELLS;++s) insert_(glpt(s).raw());
+			glpt_seed_init();
+			for(int s=0;s<glpt_seed_count();++s) insert_(glpt(s).raw());
 		}
 		//! Seeds a single root (for tests, or a caller managing its own
 		//! subset of seeds).

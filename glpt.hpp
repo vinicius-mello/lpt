@@ -221,6 +221,8 @@
 
 #include <cstdint>
 #include <cassert>
+#include <array>
+#include <vector>
 #include "lpt.hpp" // reuses lpt_table<4>: dimension-generic (level,
                     // sigperm) combinatorics, independent of seed.
 
@@ -252,100 +254,121 @@ static const int glpt_gaifullin_cells[GLPT_NCELLS][5] = {
 	{2,5,7,11,12}, {2,5,7,11,13}, {2,5,8,9,12}, {2,5,8,9,13}, {2,5,8,10,12}, {2,5,8,10,13},
 };
 
-// glpt_gaifullin_neighbor[c][i] = the cell sharing cell c's facet
-// opposite its i-th local vertex (or -1 if none was found -- should
-// never happen for a closed manifold's own triangulation, and is
-// asserted against in glpt_gaifullin_init()). Filled lazily by
-// glpt_gaifullin_init(), which the application must call once before
-// using any glpt root-level neighbor() call.
-static int glpt_gaifullin_neighbor[GLPT_NCELLS][5];
-// See glpt_gaifullin_init()'s own comment, right before it's filled.
-static int glpt_gaifullin_orientation[GLPT_NCELLS];
-static bool glpt_gaifullin_ready = false;
+// --- The active seed (runtime-configurable since 2026-10-01).
+//
+// By default the seed is Gaifullin's 108 cells above. glpt_set_seed()
+// installs any other BALANCED seed instead: each cell's 5 vertex ids in
+// colour order (so that a shared facet sits at the same local index on
+// both sides -- the property neighbor()'s seed crossing relies on), at
+// most 2^SEED_BITS = 128 cells, vertex ids in [0, nverts). With
+// allow_boundary, facets with no neighbouring cell are allowed (a seed
+// with boundary, e.g. a Kuhn-triangulated box); neighbor() then returns
+// BOUNDARY across them. Call it before building any mesh.
+//
+// glpt_seed_neighbor[c][i] = the cell sharing cell c's facet opposite
+// its i-th local vertex, or -1 (boundary). glpt_seed_orientation[c]: see
+// the comment inside glpt_seed_init(). Both are filled lazily by
+// glpt_seed_init(), which every user calls (idempotent, cheap).
+static const int (*glpt_seed_cells)[5] = glpt_gaifullin_cells;
+static int glpt_seed_ncells = GLPT_NCELLS;
+static int glpt_seed_nverts = 15;
+static bool glpt_seed_allow_boundary = false;
+static std::vector<std::array<int,5> > glpt_seed_neighbor;
+static std::vector<int> glpt_seed_orientation;
+static bool glpt_seed_ready = false;
 
-inline void glpt_gaifullin_init() {
-	if(glpt_gaifullin_ready) return;
-	for(int c=0;c<GLPT_NCELLS;++c)
-		for(int i=0;i<5;++i)
-			glpt_gaifullin_neighbor[c][i] = -1;
-	for(int c=0;c<GLPT_NCELLS;++c) {
+inline void glpt_set_seed(const int (*cells)[5], int ncells, int nverts, bool allow_boundary) {
+	assert(ncells>0 && ncells<=128 && "glpt_set_seed: at most 2^SEED_BITS cells");
+	glpt_seed_cells = cells; glpt_seed_ncells = ncells; glpt_seed_nverts = nverts;
+	glpt_seed_allow_boundary = allow_boundary;
+	glpt_seed_ready = false;
+}
+
+inline void glpt_seed_init() {
+	if(glpt_seed_ready) return;
+	const int N = glpt_seed_ncells;
+	glpt_seed_neighbor.assign(N, std::array<int,5>{{-1,-1,-1,-1,-1}});
+	glpt_seed_orientation.assign(N, 0);
+	for(int c=0;c<N;++c) {
 		for(int i=0;i<5;++i) {
 			// the facet of cell c opposite local vertex i: its other 4 vertices
 			int facet[4]; int k=0;
-			for(int j=0;j<5;++j) if(j!=i) facet[k++]=glpt_gaifullin_cells[c][j];
-			if(glpt_gaifullin_neighbor[c][i]!=-1) continue; // already found from the other side
-			for(int c2=c+1;c2<GLPT_NCELLS;++c2) {
+			for(int j=0;j<5;++j) if(j!=i) facet[k++]=glpt_seed_cells[c][j];
+			if(glpt_seed_neighbor[c][i]!=-1) continue; // already found from the other side
+			for(int c2=c+1;c2<N;++c2) {
 				// count shared vertices between {facet} and cell c2's 5 vertices
 				int shared=0, other_i=-1;
 				for(int jj=0;jj<5;++jj) {
 					bool in_facet=false;
-					for(int kk=0;kk<4;++kk) if(glpt_gaifullin_cells[c2][jj]==facet[kk]) { in_facet=true; break; }
+					for(int kk=0;kk<4;++kk) if(glpt_seed_cells[c2][jj]==facet[kk]) { in_facet=true; break; }
 					if(in_facet) ++shared; else other_i=jj;
 				}
 				if(shared==4) {
-					glpt_gaifullin_neighbor[c][i]=c2;
-					glpt_gaifullin_neighbor[c2][other_i]=c;
+					assert(other_i==i && "glpt seed is not colour-ordered: a shared facet "
+						"sits at different local indices on its two sides");
+					glpt_seed_neighbor[c][i]=c2;
+					glpt_seed_neighbor[c2][other_i]=c;
 					break;
 				}
 			}
-			assert(glpt_gaifullin_neighbor[c][i]>=0
-				&& "Gaifullin triangulation has no boundary facets (CP^2 is closed) -- "
-				   "a -1 here means glpt_gaifullin_cells doesn't match riemann_cp2.cpp's "
-				   "gaifullin_cells_raw, or that data itself changed.");
+			assert((glpt_seed_allow_boundary || glpt_seed_neighbor[c][i]>=0)
+				&& "closed seed has a boundary facet -- the cell list is wrong "
+				   "(for Gaifullin's CP^2, it no longer matches riemann_cp2.cpp's "
+				   "gaifullin_cells_raw)");
 		}
 	}
-	// glpt_gaifullin_orientation[c]: the sign (+-1) that makes a cell's
-	// OWN seed_index()-relative orientation() (see class glpt below --
-	// the dimension-generic sigperm-parity formula, ported verbatim from
-	// lpt.hpp, giving +1 at any seed's own root) combine into a
-	// GLOBALLY coherent orientation, under the standard boundary-
-	// operator sign convention (-1)^local_index that vgtl's own
-	// ord_split.hpp already uses (include/vgtl/top/ord_split.hpp:52-53)
-	// -- i.e. so that two cells sharing a facet always induce OPPOSITE
-	// orientations on it. Derived by the SAME BFS as riemann_cp2.cpp's
-	// reorient_via_bfs()/count_incoherent(): seed 0 arbitrarily gets +1,
-	// propagated across glpt_gaifullin_neighbor via
-	// required = -orientation(c)*(-1)^i*(-1)^i2 at each shared facet.
-	// riemann_cp2.cpp's own comment already established (offline, before
-	// this file existed) that this reaches 0 conflicts for this exact
-	// vertex data, since Gaifullin's dual graph is bipartite; re-checked
-	// here (assert) against THIS file's own independently-computed
-	// glpt_gaifullin_neighbor, and again, at arbitrary depth via
-	// neighbor(), by glpt_test.cpp's orientation-coherence test.
+	// glpt_seed_orientation[c]: the sign (+-1) that makes a cell's OWN
+	// seed_index()-relative orientation() (see class glpt below -- the
+	// dimension-generic sigperm-parity formula, ported verbatim from
+	// lpt.hpp, giving +1 at any seed's own root) combine into a GLOBALLY
+	// coherent orientation, under the standard boundary-operator sign
+	// convention (-1)^local_index that vgtl's own ord_split.hpp already
+	// uses (include/vgtl/top/ord_split.hpp:52-53) -- i.e. so that two
+	// cells sharing a facet always induce OPPOSITE orientations on it.
+	// Derived by the SAME BFS as riemann_cp2.cpp's reorient_via_bfs()/
+	// count_incoherent(): seed 0 arbitrarily gets +1, propagated across
+	// glpt_seed_neighbor via required = -orientation(c)*(-1)^i*(-1)^i2 at
+	// each shared facet. For Gaifullin's seed this reaches 0 conflicts
+	// (its dual graph is bipartite), re-checked here by assert and, at
+	// arbitrary depth via neighbor(), by glpt_test.cpp's
+	// orientation-coherence test.
 	{
-		bool visited[GLPT_NCELLS];
-		for(int c=0;c<GLPT_NCELLS;++c) visited[c]=false;
-		int queue_arr[GLPT_NCELLS]; int qh=0, qt=0;
-		glpt_gaifullin_orientation[0] = 1;
-		visited[0] = true;
+		std::vector<char> visited(N,0);
+		std::vector<int> queue_arr(N); int qh=0, qt=0;
+		glpt_seed_orientation[0] = 1;
+		visited[0] = 1;
 		queue_arr[qt++] = 0;
 		while(qh<qt) {
 			int c = queue_arr[qh++];
 			for(int i=0;i<5;++i) {
-				int c2 = glpt_gaifullin_neighbor[c][i];
+				int c2 = glpt_seed_neighbor[c][i];
+				if(c2<0) continue; // boundary facet
 				int i2 = -1;
-				for(int k=0;k<5;++k) if(glpt_gaifullin_neighbor[c2][k]==c) { i2=k; break; }
+				for(int k=0;k<5;++k) if(glpt_seed_neighbor[c2][k]==c) { i2=k; break; }
 				int sign0 = (i%2==0) ? 1 : -1;
 				int sign1 = (i2%2==0) ? 1 : -1;
-				int required = -glpt_gaifullin_orientation[c]*sign0*sign1;
+				int required = -glpt_seed_orientation[c]*sign0*sign1;
 				if(visited[c2]) {
-					assert(glpt_gaifullin_orientation[c2]==required
-						&& "Gaifullin orientation BFS found a conflict -- expected 0, "
-						   "since the dual graph is bipartite (verified offline in "
-						   "riemann_cp2.cpp); a conflict here means glpt_gaifullin_cells "
-						   "doesn't match that verified data, or it changed.");
+					assert(glpt_seed_orientation[c2]==required
+						&& "glpt seed orientation BFS found a conflict -- the seed is "
+						   "not orientable, or its cell list is wrong");
 					continue;
 				}
-				glpt_gaifullin_orientation[c2] = required;
-				visited[c2] = true;
+				glpt_seed_orientation[c2] = required;
+				visited[c2] = 1;
 				queue_arr[qt++] = c2;
 			}
 		}
-		assert(qt==GLPT_NCELLS && "Gaifullin orientation BFS didn't reach all 108 cells -- "
-			"the dual graph should be connected (it's a closed, connected manifold).");
+		assert(qt==N && "glpt seed orientation BFS didn't reach every cell -- "
+			"the seed's dual graph must be connected");
 	}
-	glpt_gaifullin_ready = true;
+	glpt_seed_ready = true;
 }
+//! Kept for existing callers: initializes the ACTIVE seed (Gaifullin's
+//! unless glpt_set_seed() installed another one).
+inline void glpt_gaifullin_init() { glpt_seed_init(); }
+inline int glpt_seed_count() { return glpt_seed_ncells; }
+inline int glpt_seed_vertex_count() { return glpt_seed_nverts; }
 
 // --- The extended LPT code itself: dim=4 fixed (CP^2's real
 // dimension), (level, sigperm, orthant_level, orthant[4]) exactly as
@@ -469,8 +492,8 @@ class glpt {
 		//! convention (include/vgtl/top/ord_split.hpp) -- verified by
 		//! glpt_test.cpp's orientation-coherence test.
 		int orientation() const {
-			glpt_gaifullin_init();
-			return glpt_gaifullin_orientation[seed_index()] * seed_relative_orientation();
+			glpt_seed_init();
+			return glpt_seed_orientation[seed_index()] * seed_relative_orientation();
 		}
 
 		//! Same as lpt<dim,code>::is_child0 -- dimension-generic, no seed
@@ -813,7 +836,7 @@ class glpt {
 		// Sentinel returned by neighbor() when the geometric approach
 		// itself can't resolve a result (should be essentially never --
 		// see glpt_neighbor_geometric's own comment).
-		enum result { OK=0, GLPT_DEEP_CROSSING_UNIMPLEMENTED=1 };
+		enum result { OK=0, GLPT_DEEP_CROSSING_UNIMPLEMENTED=1, BOUNDARY=2 };
 
 		// ============================================================
 		// FAST CANDIDATE (Theorem 2's formula), GATED BY THE EXACT
@@ -957,13 +980,17 @@ class glpt {
 					r = fast_candidate(i);
 					return OK;
 				}
-				glpt_gaifullin_init();
-				r = with_seed(glpt_gaifullin_neighbor[seed_index()][j]);
+				glpt_seed_init();
+				int nb = glpt_seed_neighbor[seed_index()][j];
+				if(nb<0) return BOUNDARY; // facet on the boundary of a seed with boundary
+				r = with_seed(nb);
 				return OK;
 			}
 			// root: facet i IS seed facet i
-			glpt_gaifullin_init();
-			r = glpt(glpt_gaifullin_neighbor[seed_index()][i]);
+			glpt_seed_init();
+			int nb = glpt_seed_neighbor[seed_index()][i];
+			if(nb<0) return BOUNDARY;
+			r = glpt(nb);
 			return OK;
 		}
 };
@@ -1169,8 +1196,8 @@ inline bool glpt_neighbor_geometric(const glpt& c, int local_excluded_i, glpt& r
 	// as valid here as it is in case A.
 	int target_seed;
 	if(best<1e-9) {
-		glpt_gaifullin_init();
-		int nb_seed = glpt_gaifullin_neighbor[c.seed_index()][orig_excluded];
+		glpt_seed_init();
+		int nb_seed = glpt_seed_neighbor[c.seed_index()][orig_excluded];
 		if(nb_seed<0) return false;
 		target_seed = nb_seed;
 	} else {
