@@ -269,6 +269,19 @@ static const int glpt_gaifullin_cells[GLPT_NCELLS][5] = {
 // its i-th local vertex, or -1 (boundary). glpt_seed_orientation[c]: see
 // the comment inside glpt_seed_init(). Both are filled lazily by
 // glpt_seed_init(), which every user calls (idempotent, cheap).
+// Code field widths. The defaults (7 seed bits, 10 orthant bits per
+// coordinate: 62 bits, depth up to 43) fit Gaifullin's 108 cells; a
+// larger seed can trade orthant bits for seed bits by defining these
+// before including this header (e.g. 9 and 9: 512 cells, depth up to
+// 39, 60 bits). Bit 63 stays free for glpt_tree's PRESENT flag.
+#ifndef GLPT_SEED_BITS
+#define GLPT_SEED_BITS 7
+#endif
+#ifndef GLPT_ORTH_BITS
+#define GLPT_ORTH_BITS 10
+#endif
+static_assert(GLPT_SEED_BITS+2+9+4+4*GLPT_ORTH_BITS<=63, "glpt code must leave bit 63 free");
+
 static const int (*glpt_seed_cells)[5] = glpt_gaifullin_cells;
 static int glpt_seed_ncells = GLPT_NCELLS;
 static int glpt_seed_nverts = 15;
@@ -278,7 +291,7 @@ static std::vector<int> glpt_seed_orientation;
 static bool glpt_seed_ready = false;
 
 inline void glpt_set_seed(const int (*cells)[5], int ncells, int nverts, bool allow_boundary) {
-	assert(ncells>0 && ncells<=128 && "glpt_set_seed: at most 2^SEED_BITS cells");
+	assert(ncells>0 && ncells<=(1<<GLPT_SEED_BITS) && "glpt_set_seed: at most 2^GLPT_SEED_BITS cells");
 	glpt_seed_cells = cells; glpt_seed_ncells = ncells; glpt_seed_nverts = nverts;
 	glpt_seed_allow_boundary = allow_boundary;
 	glpt_seed_ready = false;
@@ -391,7 +404,7 @@ class glpt {
 	public:
 		static const int DIM = 4;
 	private:
-		static const int SEED_BITS=7, LEVEL_BITS=2, SIGPERM_BITS=9, ORTHLVL_BITS=4, ORTH_BITS=10;
+		static const int SEED_BITS=GLPT_SEED_BITS, LEVEL_BITS=2, SIGPERM_BITS=9, ORTHLVL_BITS=4, ORTH_BITS=GLPT_ORTH_BITS;
 		static const int SEED_OFF=0;
 		static const int LEVEL_OFF=SEED_OFF+SEED_BITS;       // 7
 		static const int SIGPERM_OFF=LEVEL_OFF+LEVEL_BITS;   // 9
